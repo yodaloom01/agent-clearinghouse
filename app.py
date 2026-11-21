@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from typing import Optional, List
 
 from fastapi import FastAPI, Header, HTTPException, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 import verification as V
@@ -577,6 +577,18 @@ def activity(limit: int = 25):
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     with open("dashboard.html", "r") as f:
+        return f.read()
+
+
+@app.get("/connect", response_class=HTMLResponse)
+def connect():
+    with open("connect.html", "r") as f:
+        return f.read()
+
+
+@app.get("/llms.txt", response_class=PlainTextResponse)
+def llms_txt():
+    with open("llms.txt", "r") as f:
         return f.read()
 
 
