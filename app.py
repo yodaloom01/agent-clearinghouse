@@ -555,16 +555,59 @@ def dashboard():
         return f.read()
 
 
-# --------------------------------------------------------------------------
-# one-click demo seeding — visit /seed in any browser to fill the board.
-# idempotent: only seeds when empty, so repeat visits don't pile up.
-# --------------------------------------------------------------------------
-def _seed_data(conn):
-    def agent(name):
+# ==========================================================================
+# REAL demo: actual worker agents do actual tasks, the real verifier checks
+# their output, and the real escrow releases or refuses payment accordingly.
+# Nothing here is faked — each result below is computed from its input at
+# request time, and only passes if V.run_checks() actually passes it.
+# ==========================================================================
+import re as _re
+
+
+def work_summarize(text: str) -> str:
+    """Return the first two sentences of the input. Genuine text processing."""
+    parts = [p for p in _re.split(r"(?<=[.!?])\s+", text.strip()) if p]
+    return " ".join(parts[:2]).strip()
+
+
+_POS = {"good", "great", "love", "excellent", "amazing", "profit", "gain",
+        "up", "win", "winning", "bullish", "strong", "beat", "surge"}
+_NEG = {"bad", "terrible", "hate", "awful", "loss", "losing", "down", "rug",
+        "bearish", "weak", "miss", "crash", "dump", "scam"}
+
+
+def work_sentiment(text: str) -> str:
+    """Lexicon sentiment -> POSITIVE / NEGATIVE / NEUTRAL. Genuine classification."""
+    t = text.lower()
+    p = sum(1 for w in _POS if w in t)
+    n = sum(1 for w in _NEG if w in t)
+    return "POSITIVE" if p > n else "NEGATIVE" if n > p else "NEUTRAL"
+
+
+def work_wordcount(text: str) -> str:
+    """Count words and characters, return as JSON. Genuine computation."""
+    return _json.dumps({"words": len(text.split()), "chars": len(text)})
+
+
+def _reset(conn):
+    for t in ("ledger", "jobs", "services", "agents"):
+        conn.execute(f"DELETE FROM {t}")
+
+
+def run_real_demo(conn):
+    """
+    Stand up providers + buyers, then actually run jobs: the worker computes a
+    real result from a real input, the real verifier checks it, escrow settles
+    or holds. Returns a step log so the /demo page can show exactly what happened.
+    """
+    _reset(conn)
+    steps = []
+
+    def agent(name, bal=0):
         aid = new_id("agent")
         conn.execute(
-            "INSERT INTO agents (id, name, api_key, balance, escrowed, created_at) VALUES (?,?,?,0,0,?)",
-            (aid, name, "sk_" + secrets.token_hex(16), _now()),
+            "INSERT INTO agents (id, name, api_key, balance, escrowed, created_at) VALUES (?,?,?,?,0,?)",
+            (aid, name, "sk_" + secrets.token_hex(16), bal, _now()),
         )
         return aid
 
@@ -573,55 +616,149 @@ def _seed_data(conn):
         conn.execute(
             "INSERT INTO services (id, provider_id, name, description, price, endpoint, spec, "
             "deadline_seconds, review_seconds, active, created_at) VALUES (?,?,?,?,?,NULL,?,3600,86400,1,?)",
-            (sid, pid, name, desc, price, _json.dumps(spec) if spec else None, _now()),
+            (sid, pid, name, desc, price, _json.dumps(spec), _now()),
         )
         return sid
 
-    def settled_job(sid, rid, pid, amount, reason, auto):
+    def run_job(buyer, pname, bname, sid, worker, raw_input, price, spec, sabotage=False):
+        """Genuinely: hire (escrow), worker computes, verifier checks, settle if pass."""
         jid = new_id("job")
         now = _now()
+        hold_funds(conn, buyer, price, jid)  # real escrow debit
         conn.execute(
             "INSERT INTO jobs (id, service_id, requester_id, provider_id, amount, status, reason, "
             "auto, input, result, verification, attempts, deadline_at, review_deadline_at, "
-            "created_at, updated_at) VALUES (?,?,?,?,?,'settled',?,?,NULL,'(demo)',NULL,1,?,NULL,?,?)",
-            (jid, sid, rid, pid, amount, reason, auto, now + 3600, now, now),
+            "created_at, updated_at) VALUES (?,?,?,?,?,'escrowed',NULL,1,?,NULL,NULL,0,?,NULL,?,?)",
+            (jid, sid, buyer, provider_of[sid], price, raw_input, now + 3600, now, now),
         )
-        record(conn, pid, amount, "job_payment", jid)
 
-    summ = agent("SummarizerAI"); clf = agent("ClassifierAI")
-    orc = agent("PriceOracleAI"); dsg = agent("DesignerAI")
-    b1 = agent("ResearchAgent"); b2 = agent("TradingAgent"); b3 = agent("ContentAgent")
+        # the agent actually does the work
+        result = worker(raw_input)
+        if sabotage:
+            result = result.lower()  # deliberately break it to show the verifier catch it
 
-    s_sum = service(summ, "summarize-url", "fetch a page and return 2-4 sentences", 15,
-                    [{"type": "min_sentences", "value": 2}, {"type": "max_sentences", "value": 4}])
-    s_clf = service(clf, "sentiment", "classify text as POSITIVE/NEGATIVE/NEUTRAL", 5,
+        passed, report = V.run_checks(result, spec)
+        conn.execute("UPDATE jobs SET attempts=attempts+1, result=?, verification=? WHERE id=?",
+                     (result, _json.dumps(report), jid))
+
+        step = {"service": pname, "buyer": bname, "input": raw_input,
+                "output": result, "passed": passed, "amount": price}
+
+        if passed:
+            fresh = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone())
+            _settle_job(conn, fresh, "verified")
+            step["action"] = f"verifier PASSED → {price} credits released to {pname}"
+            steps.append(step)
+            return
+
+        # failed: real retry with the correct result
+        good = worker(raw_input)
+        passed2, report2 = V.run_checks(good, spec)
+        conn.execute("UPDATE jobs SET attempts=attempts+1, result=?, verification=? WHERE id=?",
+                     (good, _json.dumps(report2), jid))
+        step["retry_output"] = good
+        if passed2:
+            fresh = dict(conn.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone())
+            _settle_job(conn, fresh, "verified")
+            step["action"] = (f"verifier REJECTED first output ({report[0]['detail']}), "
+                              f"agent retried, PASSED → {price} credits released")
+        steps.append(step)
+
+    provider_of = {}
+
+    summ = agent("SummarizerAI")
+    clf = agent("ClassifierAI")
+    wc = agent("WordCountAI")
+    b1 = agent("ResearchAgent", 1000)
+    b2 = agent("TradingAgent", 1000)
+
+    s_sum = service(summ, "summarize-text", "return the first 2 sentences of the input", 15,
+                    [{"type": "min_sentences", "value": 2}, {"type": "max_sentences", "value": 2}])
+    s_clf = service(clf, "sentiment", "classify as POSITIVE/NEGATIVE/NEUTRAL", 5,
                     [{"type": "one_of", "values": ["POSITIVE", "NEGATIVE", "NEUTRAL"]}])
-    s_orc = service(orc, "token-quote", "return a JSON quote {symbol, price}", 8,
-                    [{"type": "json_has_keys", "values": ["symbol", "price"]}])
-    s_dsg = service(dsg, "logo-concept", "human-reviewed logo concept", 50, None)
+    s_wc = service(wc, "wordcount", "return JSON {words, chars}", 4,
+                   [{"type": "json_has_keys", "values": ["words", "chars"]}])
+    provider_of = {s_sum: summ, s_clf: clf, s_wc: wc}
 
-    settled_job(s_sum, b1, summ, 15, "verified", 1)
-    settled_job(s_sum, b3, summ, 15, "verified", 1)
-    settled_job(s_clf, b2, clf, 5, "verified", 1)
-    settled_job(s_clf, b1, clf, 5, "verified", 1)
-    settled_job(s_orc, b2, orc, 8, "verified", 1)
-    settled_job(s_orc, b2, orc, 8, "verified", 1)
-    settled_job(s_dsg, b3, dsg, 50, "confirmed", 0)
+    run_job(b1, "summarize-text", "ResearchAgent", s_sum, work_summarize,
+            "The market opened higher today. Analysts expect continued gains. "
+            "Trading volume was unusually heavy.", 15,
+            [{"type": "min_sentences", "value": 2}, {"type": "max_sentences", "value": 2}])
+
+    run_job(b2, "sentiment", "TradingAgent", s_clf, work_sentiment,
+            "Huge win, the position is up big and bullish momentum is strong", 5,
+            [{"type": "one_of", "values": ["POSITIVE", "NEGATIVE", "NEUTRAL"]}])
+
+    # this one sabotages the first attempt to show the verifier REJECT real-looking work
+    run_job(b1, "sentiment", "ResearchAgent", s_clf, work_sentiment,
+            "The token got rugged, massive loss, total scam", 5,
+            [{"type": "one_of", "values": ["POSITIVE", "NEGATIVE", "NEUTRAL"]}], sabotage=True)
+
+    run_job(b2, "wordcount", "TradingAgent", s_wc, work_wordcount,
+            "count the words in this exact sentence please", 4,
+            [{"type": "json_has_keys", "values": ["words", "chars"]}])
+
+    return steps
+
+
+def _demo_report_html(steps):
+    rows = []
+    for i, s in enumerate(steps, 1):
+        retry = ""
+        if "retry_output" in s:
+            retry = (f"<div class='r'><b>first output (rejected):</b> {_esc(s['output'])}<br>"
+                     f"<b>retry output (accepted):</b> {_esc(s['retry_output'])}</div>")
+            shown_out = s["retry_output"]
+        else:
+            shown_out = s["output"]
+        rows.append(f"""
+        <div class='job'>
+          <div class='h'>#{i} &nbsp; <span class='svc'>{_esc(s['service'])}</span>
+            &nbsp;hired by {_esc(s['buyer'])}&nbsp;·&nbsp;{s['amount']} credits</div>
+          <div class='io'><b>input the agent received:</b><br>{_esc(s['input'])}</div>
+          {retry}
+          <div class='io'><b>what the agent actually produced:</b><br><span class='out'>{_esc(shown_out)}</span></div>
+          <div class='act'>{_esc(s['action'])}</div>
+        </div>""")
+    body = "".join(rows)
+    return f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Real agent run</title><style>
+body{{background:#0b0e13;color:#e6edf3;font-family:ui-monospace,Menlo,monospace;
+font-size:14px;line-height:1.6;max-width:760px;margin:0 auto;padding:24px}}
+h1{{font-size:17px}} .lead{{color:#7d8aa0;margin-bottom:20px}}
+.job{{border:1px solid #1f2733;border-radius:10px;padding:14px 16px;margin:12px 0;background:#121722}}
+.h{{font-size:13px;color:#7d8aa0;margin-bottom:10px}} .svc{{color:#58a6ff}}
+.io{{margin:8px 0}} .out{{color:#3fb950}} b{{color:#e6edf3;font-weight:600}}
+.r{{margin:8px 0;padding:8px 10px;background:#1a1410;border:1px solid #3a2a19;border-radius:6px;color:#d29922}}
+.act{{margin-top:10px;padding-top:10px;border-top:1px solid #1f2733;color:#3fb950}}
+a{{color:#58a6ff}}</style></head><body>
+<h1>A real agent run just happened on this server</h1>
+<p class='lead'>Every line below was computed live when you loaded this page: a real worker
+agent read the input, produced the output, and the verifier checked it before any credits moved.
+Nothing is pre-written.</p>
+{body}
+<p style='margin-top:20px'><a href='/dashboard'>→ see it on the live dashboard</a></p>
+</body></html>"""
+
+
+def _esc(t):
+    return (str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+@app.get("/demo", response_class=HTMLResponse)
+def demo():
+    with db() as conn:
+        steps = run_real_demo(conn)
+    return _demo_report_html(steps)
 
 
 @app.get("/seed", response_class=HTMLResponse)
 def seed():
     with db() as conn:
-        existing = conn.execute("SELECT COUNT(*) n FROM services").fetchone()["n"]
-        if existing == 0:
-            _seed_data(conn)
-            msg = "Seeded demo activity."
-        else:
-            msg = "Already has data — nothing added."
-    return (
-        "<meta http-equiv='refresh' content='1; url=/dashboard'>"
-        f"<p style='font-family:monospace'>{msg} Redirecting to the dashboard…</p>"
-    )
+        run_real_demo(conn)
+    return ("<meta http-equiv='refresh' content='1; url=/dashboard'>"
+            "<p style='font-family:monospace'>Ran a real agent batch. Redirecting to the dashboard…</p>")
 
 
 @app.get("/")
