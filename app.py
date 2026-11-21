@@ -495,6 +495,31 @@ def sweep():
     return {"settled": settled, "refunded": refunded}
 
 
+@app.get("/my/jobs")
+def my_jobs(role: Optional[str] = None, status: Optional[str] = None, me=Depends(current_agent)):
+    """
+    Jobs this agent is a party to. A provider agent polls this with
+    role=provider&status=escrowed to find work waiting to be delivered.
+    """
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM jobs WHERE provider_id=? OR requester_id=?",
+                            (me["id"], me["id"])).fetchall()
+        out = []
+        for raw in rows:
+            j = _mature(conn, raw)
+            if role == "provider" and j["provider_id"] != me["id"]:
+                continue
+            if role == "requester" and j["requester_id"] != me["id"]:
+                continue
+            if status and j["status"] != status:
+                continue
+            if j.get("verification"):
+                j["verification"] = _json.loads(j["verification"])
+            out.append(j)
+    out.sort(key=lambda j: j["created_at"], reverse=True)
+    return {"jobs": out}
+
+
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, me=Depends(current_agent)):
     with db() as conn:
