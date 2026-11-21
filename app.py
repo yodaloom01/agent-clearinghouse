@@ -555,6 +555,75 @@ def dashboard():
         return f.read()
 
 
+# --------------------------------------------------------------------------
+# one-click demo seeding — visit /seed in any browser to fill the board.
+# idempotent: only seeds when empty, so repeat visits don't pile up.
+# --------------------------------------------------------------------------
+def _seed_data(conn):
+    def agent(name):
+        aid = new_id("agent")
+        conn.execute(
+            "INSERT INTO agents (id, name, api_key, balance, escrowed, created_at) VALUES (?,?,?,0,0,?)",
+            (aid, name, "sk_" + secrets.token_hex(16), _now()),
+        )
+        return aid
+
+    def service(pid, name, desc, price, spec):
+        sid = new_id("svc")
+        conn.execute(
+            "INSERT INTO services (id, provider_id, name, description, price, endpoint, spec, "
+            "deadline_seconds, review_seconds, active, created_at) VALUES (?,?,?,?,?,NULL,?,3600,86400,1,?)",
+            (sid, pid, name, desc, price, _json.dumps(spec) if spec else None, _now()),
+        )
+        return sid
+
+    def settled_job(sid, rid, pid, amount, reason, auto):
+        jid = new_id("job")
+        now = _now()
+        conn.execute(
+            "INSERT INTO jobs (id, service_id, requester_id, provider_id, amount, status, reason, "
+            "auto, input, result, verification, attempts, deadline_at, review_deadline_at, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,'settled',?,?,NULL,'(demo)',NULL,1,?,NULL,?,?)",
+            (jid, sid, rid, pid, amount, reason, auto, now + 3600, now, now),
+        )
+        record(conn, pid, amount, "job_payment", jid)
+
+    summ = agent("SummarizerAI"); clf = agent("ClassifierAI")
+    orc = agent("PriceOracleAI"); dsg = agent("DesignerAI")
+    b1 = agent("ResearchAgent"); b2 = agent("TradingAgent"); b3 = agent("ContentAgent")
+
+    s_sum = service(summ, "summarize-url", "fetch a page and return 2-4 sentences", 15,
+                    [{"type": "min_sentences", "value": 2}, {"type": "max_sentences", "value": 4}])
+    s_clf = service(clf, "sentiment", "classify text as POSITIVE/NEGATIVE/NEUTRAL", 5,
+                    [{"type": "one_of", "values": ["POSITIVE", "NEGATIVE", "NEUTRAL"]}])
+    s_orc = service(orc, "token-quote", "return a JSON quote {symbol, price}", 8,
+                    [{"type": "json_has_keys", "values": ["symbol", "price"]}])
+    s_dsg = service(dsg, "logo-concept", "human-reviewed logo concept", 50, None)
+
+    settled_job(s_sum, b1, summ, 15, "verified", 1)
+    settled_job(s_sum, b3, summ, 15, "verified", 1)
+    settled_job(s_clf, b2, clf, 5, "verified", 1)
+    settled_job(s_clf, b1, clf, 5, "verified", 1)
+    settled_job(s_orc, b2, orc, 8, "verified", 1)
+    settled_job(s_orc, b2, orc, 8, "verified", 1)
+    settled_job(s_dsg, b3, dsg, 50, "confirmed", 0)
+
+
+@app.get("/seed", response_class=HTMLResponse)
+def seed():
+    with db() as conn:
+        existing = conn.execute("SELECT COUNT(*) n FROM services").fetchone()["n"]
+        if existing == 0:
+            _seed_data(conn)
+            msg = "Seeded demo activity."
+        else:
+            msg = "Already has data — nothing added."
+    return (
+        "<meta http-equiv='refresh' content='1; url=/dashboard'>"
+        f"<p style='font-family:monospace'>{msg} Redirecting to the dashboard…</p>"
+    )
+
+
 @app.get("/")
 def root():
     return {"service": "Agent Clearinghouse", "version": app.version,
